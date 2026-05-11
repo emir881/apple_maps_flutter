@@ -59,6 +59,10 @@ public class AppleMapController: NSObject, FlutterPlatformView {
     }
     
     deinit {
+        // Detach the method-call handler so any in-flight messages from Dart
+        // can't reach a deallocated `self` (was crashing as EXC_BAD_ACCESS in
+        // setMethodCallHandler / annotationsToChange / objc_msgSend).
+        channel.setMethodCallHandler(nil)
         self.removeAllAnnotations()
         self.removeAllCircles()
         self.removeAllPolygons()
@@ -76,7 +80,18 @@ public class AppleMapController: NSObject, FlutterPlatformView {
     }
     
     private func setMethodCallHandlers() {
-        channel.setMethodCallHandler({ [unowned self] (call: FlutterMethodCall, result: @escaping FlutterResult) -> Void in
+        channel.setMethodCallHandler({ [weak self] (call: FlutterMethodCall, result: @escaping FlutterResult) -> Void in
+            // `unowned self` crashed with EXC_BAD_ACCESS when Dart dispatched a
+            // method call (annotations#update, etc.) after the controller had
+            // already been disposed. `weak self` lets us bail out cleanly.
+            guard let self = self else {
+                result(FlutterError(
+                    code: "CONTROLLER_RELEASED",
+                    message: "AppleMapController was deallocated before handling \(call.method)",
+                    details: nil
+                ))
+                return
+            }
             if let args: Dictionary<String, Any> = call.arguments as? Dictionary<String,Any> {
                 switch(call.method) {
                 case "annotations#update":
@@ -121,7 +136,24 @@ public class AppleMapController: NSObject, FlutterPlatformView {
                     break
                 case "map#takeSnapshot":
                     self.takeSnapshot(options: SnapshotOptions.init(options: args), onCompletion: { (snapshot: FlutterStandardTypedData?, error: Error?) -> Void in
-                        result(snapshot ?? error)
+                        // Swift `Error` is not encodable by FlutterStandardCodec; wrap it as FlutterError.
+                        // Previously `result(snapshot ?? error)` would crash with
+                        // NSInternalInconsistencyException: "Unsupported value for standard codec".
+                        if let snapshot = snapshot {
+                            result(snapshot)
+                        } else if let error = error {
+                            result(FlutterError(
+                                code: "MAP_SNAPSHOT_FAILED",
+                                message: error.localizedDescription,
+                                details: nil
+                            ))
+                        } else {
+                            result(FlutterError(
+                                code: "MAP_SNAPSHOT_EMPTY",
+                                message: "Snapshot returned empty result",
+                                details: nil
+                            ))
+                        }
                     })
                 default:
                     result(FlutterMethodNotImplemented)
@@ -386,15 +418,29 @@ extension AppleMapController {
         snapShot?.cancel()
         
         if #available(iOS 10.0, *) {
-            snapShot?.start { [unowned self] snapshot, error in
+            snapShot?.start { [weak self] snapshot, error in
+                // Use `weak` instead of `unowned` so that disposing the controller
+                // mid-snapshot does not crash with EXC_BAD_ACCESS.
+                guard let self = self else {
+                    onCompletion(nil, NSError(
+                        domain: "AppleMapController",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Controller deallocated during snapshot"]
+                    ))
+                    return
+                }
                 guard let snapshot = snapshot, error == nil else {
-                    onCompletion(nil, error)
+                    onCompletion(nil, error ?? NSError(
+                        domain: "AppleMapController",
+                        code: -2,
+                        userInfo: [NSLocalizedDescriptionKey: "Unknown snapshot error"]
+                    ))
                     return
                 }
 
                 let image = UIGraphicsImageRenderer(size: self.snapShotOptions.size).image { context in
                     snapshot.image.draw(at: .zero)
-                    let rect = snapShotOptions.mapRect
+                    let rect = self.snapShotOptions.mapRect
                     for overlay in self.mapView.overlays {
                         if ((overlay.intersects?(rect)) != nil) {
                             self.drawOverlays(overlay: overlay, snapshot: snapshot, context: context)
@@ -403,13 +449,27 @@ extension AppleMapController {
                     for annotation in self.mapView.getMapViewAnnotations() {
                         self.drawAnnotations(annotation: annotation, point: snapshot.point(for: annotation!.coordinate))
                     }
-                    
+
                 }
 
                 if let imageData = image.pngData() {
                     onCompletion(FlutterStandardTypedData.init(bytes: imageData), nil)
+                } else {
+                    // Previously this path silently dropped the callback, leaving
+                    // the Dart-side Future hanging forever.
+                    onCompletion(nil, NSError(
+                        domain: "AppleMapController",
+                        code: -3,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to encode snapshot as PNG"]
+                    ))
                 }
             }
+        } else {
+            onCompletion(nil, NSError(
+                domain: "AppleMapController",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "iOS 10+ required for snapshot"]
+            ))
         }
     }
     
