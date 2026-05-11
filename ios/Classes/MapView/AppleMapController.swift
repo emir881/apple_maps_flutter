@@ -59,6 +59,10 @@ public class AppleMapController: NSObject, FlutterPlatformView {
     }
     
     deinit {
+        // Detach the method-call handler so any in-flight messages from Dart
+        // can't reach a deallocated `self` (was crashing as EXC_BAD_ACCESS in
+        // setMethodCallHandler / annotationsToChange / objc_msgSend).
+        channel.setMethodCallHandler(nil)
         self.removeAllAnnotations()
         self.removeAllCircles()
         self.removeAllPolygons()
@@ -76,7 +80,18 @@ public class AppleMapController: NSObject, FlutterPlatformView {
     }
     
     private func setMethodCallHandlers() {
-        channel.setMethodCallHandler({ [unowned self] (call: FlutterMethodCall, result: @escaping FlutterResult) -> Void in
+        channel.setMethodCallHandler({ [weak self] (call: FlutterMethodCall, result: @escaping FlutterResult) -> Void in
+            // `unowned self` crashed with EXC_BAD_ACCESS when Dart dispatched a
+            // method call (annotations#update, etc.) after the controller had
+            // already been disposed. `weak self` lets us bail out cleanly.
+            guard let self = self else {
+                result(FlutterError(
+                    code: "CONTROLLER_RELEASED",
+                    message: "AppleMapController was deallocated before handling \(call.method)",
+                    details: nil
+                ))
+                return
+            }
             if let args: Dictionary<String, Any> = call.arguments as? Dictionary<String,Any> {
                 switch(call.method) {
                 case "annotations#update":
