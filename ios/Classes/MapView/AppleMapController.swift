@@ -403,9 +403,22 @@ extension AppleMapController: MKMapViewDelegate {
 
 extension AppleMapController {
     private func takeSnapshot(options: SnapshotOptions, onCompletion: @escaping (FlutterStandardTypedData?, Error?) -> Void) {
+        // MKMapSnapshotOptions.setSize throws NSInvalidArgumentException ("Cannot
+        // set a zero area size") if the map view has not been laid out yet (zero
+        // frame), e.g. a snapshot requested before first layout / while hidden.
+        let mapSize = self.mapView.frame.size
+        guard mapSize.width > 0, mapSize.height > 0 else {
+            onCompletion(nil, NSError(
+                domain: "AppleMapController",
+                code: -5,
+                userInfo: [NSLocalizedDescriptionKey: "Map has zero size; snapshot skipped"]
+            ))
+            return
+        }
+
         // MKMapSnapShotOptions setting.
         snapShotOptions.region = self.mapView.region
-        snapShotOptions.size = self.mapView.frame.size
+        snapShotOptions.size = mapSize
         snapShotOptions.scale = UIScreen.main.scale
         snapShotOptions.showsBuildings = options.showBuildings
         snapShotOptions.showsPointsOfInterest = options.showPointsOfInterest
