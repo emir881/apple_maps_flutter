@@ -219,6 +219,23 @@ class AppleMapController {
     return channel.invokeMethod<double>('camera#getZoomLevel');
   }
 
+  /// Kameranın hem döndürülebildiği hem de istenen uzaklıkta kaldığı en uzak
+  /// (en küçük) zoom seviyesi.
+  ///
+  /// MapKit uzak ölçekte ya `heading`'i uygulamaz ya da uygular ama kamerayı
+  /// kendisi içeri çeker. İki kriter birlikte aranır. Eşik ekran yüksekliğine
+  /// bağlı olduğundan sabit gömülemez — çalışma anında ölçülür (ikili arama;
+  /// ekranda ara durum çizilmez, kamera ölçüm sonunda geri konur).
+  ///
+  /// [fromZoom]: taramanın başlayacağı en uzak zoom (uygulamanın alt sınırı).
+  /// Dönen map: `zoom` (bulunan seviye, hiçbiri tutmuyorsa -1), `headOk`/`altOk`
+  /// (bulunan seviyenin bayrakları), `belowHead`/`belowAlt` (bir alt seviyede
+  /// hangi kriterin düştüğü — teşhis).
+  Future<Map<String, dynamic>?> maxRotatableZoom({double fromZoom = 1.0}) async {
+    return channel.invokeMapMethod<String, dynamic>(
+        'qibla#maxRotatableZoom', <String, dynamic>{'fromZoom': fromZoom});
+  }
+
   /// Return [LatLngBounds] defining the region that is visible in a map.
   Future<LatLngBounds> getVisibleRegion() async {
     final Map<String, dynamic>? latLngBounds =

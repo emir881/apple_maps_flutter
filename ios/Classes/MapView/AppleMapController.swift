@@ -73,6 +73,111 @@ public class AppleMapController: NSObject, FlutterPlatformView {
         return mapView
     }
     
+    /// Kameranin hem DONEBILDIGI hem de ISTENEN UZAKLIKTA KALDIGI en uzak
+    /// (en kucuk) zoom seviyesini olcer.
+    ///
+    /// MapKit'in uzak olcekte IKI ayri davranisi var, ikisi de olculdu:
+    ///  1. Cok uzak (zoom=1 / altitude ~31.283.000 m): `setCamera(heading:)` kabul
+    ///     edilir ama UYGULANMAZ -> camera.heading = 0, altitude korunur.
+    ///  2. Ara bolge: heading UYGULANIR ama MapKit kamerayi kendisi ICERI CEKER
+    ///     -> altitude istenenden kucuk doner.
+    ///
+    /// Yalniz heading'e bakan bir olcum 2. durumu "burasi donuyor" sayar ve fazla
+    /// uzak bir hedef secer; zoom-out oraya gider (heading=0 oldugu icin kamera
+    /// kalir), ilk pusula donusunde MapKit kamerayi iceri ceker ve kullanici
+    /// "once daha uzaga gitti, sonra geri geldi" diye gorur. Bu yuzden kriter ciftli:
+    /// **heading tutacak VE altitude korunacak.**
+    ///
+    /// Esik ekran YUKSEKLIGINE bagli (altitude hesabi bounds.height kullanir), yani
+    /// cihazdan cihaza kayar; sabit gomulemez, calisma aninda olculur.
+    ///
+    /// Yontem: [from, 14] araliginda ikili arama (~6 deneme). Denemeler animasyonsuz
+    /// ve ayni runloop turunda; sonunda ORIJINAL kamera geri konur -> ekranda ara
+    /// durum cizilmez.
+    ///
+    /// Doner: ["zoom": bulunan seviye (hicbiri tutmuyorsa -1), "headOk"/"altOk":
+    /// bulunan seviyenin bayraklari, "belowHead"/"belowAlt": bir alt (daha uzak)
+    /// seviyede hangi kriterin dustugu — teshis icin.
+    private func maxRotatableZoom(from minZoom: Double) -> [String: Any] {
+        // Harita henuz yerlesmemisse (bounds sifir) altitude hesabi 0 uretir ve olcum
+        // anlamsiz olur; -1 donup Dart'in guvenli fallback'ine birak.
+        guard mapView.bounds.size.height > 0, mapView.bounds.size.width > 0 else {
+            return ["zoom": -1.0, "headOk": false, "altOk": false,
+                    "belowHead": false, "belowAlt": false, "reason": "zeroBounds"]
+        }
+        // `as!` yerine guard: copy() teorik olarak beklenen tipi dondurmezse cokmek yerine
+        // olcumden temiz cikilir (kamera hic degistirilmemis olur).
+        guard let original = mapView.camera.copy() as? MKMapCamera else {
+            return ["zoom": -1.0, "headOk": false, "altOk": false,
+                    "belowHead": false, "belowAlt": false, "reason": "cameraCopyFailed"]
+        }
+        let center = mapView.centerCoordinate
+        let testHeading: CLLocationDirection = 90
+        let altTolerance = 0.03   // %3: MapKit yuvarlamasini gecer, gercek clamp'i yakalar
+
+        // Olcum sirasinda 8-14 kez setCamera yapiliyor; her biri `regionDidChangeAnimated`
+        // tetikleyip Dart'a `camera#onIdle` gonderir ve gereksiz rebuild firtinasi yaratirdi.
+        // Delegate'i olcum boyunca askiya al, sonunda geri tak (defer ile her yolda).
+        let savedDelegate = mapView.delegate
+        mapView.delegate = nil
+        defer { mapView.delegate = savedDelegate }
+
+        // Bir seviyeyi dene: (heading uygulandi mi, kamera istenen uzaklikta kaldi mi)
+        func probe(_ zoom: Double) -> (head: Bool, alt: Bool) {
+            let wantAlt = probeAltitude(centerCoordinate: center, zoomLevel: zoom)
+            mapView.setCamera(
+                MKMapCamera(lookingAtCenter: center, fromDistance: wantAlt, pitch: 0, heading: testHeading),
+                animated: false)
+            let headOk = abs(mapView.camera.heading - testHeading) < 1.0
+            let gotAlt = mapView.camera.altitude
+            let altOk = wantAlt > 0 && abs(gotAlt - wantAlt) / wantAlt < altTolerance
+            return (headOk, altOk)
+        }
+
+        func holds(_ zoom: Double) -> Bool {
+            let r = probe(zoom)
+            return r.head && r.alt
+        }
+
+        var lo = minZoom      // beklenen: TUTMUYOR
+        var hi = 14.0         // beklenen: TUTUYOR
+        var found = hi
+
+        if holds(lo) {                    // istenen zoom zaten hem donuyor hem kaliyor
+            found = lo
+        } else if !holds(hi) {            // beklenmedik: hicbir yerde tutmuyor
+            let r = probe(hi)
+            let b = probe(hi - 0.25)
+            mapView.setCamera(original, animated: false)
+            return ["zoom": -1.0, "headOk": r.head, "altOk": r.alt,
+                    "belowHead": b.head, "belowAlt": b.alt]
+        } else {
+            while hi - lo > 0.25 {
+                let mid = (lo + hi) / 2
+                if holds(mid) { hi = mid } else { lo = mid }
+            }
+            found = hi
+        }
+
+        let r = probe(found)
+        let b = probe(found - 0.25)       // bir alt seviyede hangi kriter dusuyor?
+        mapView.setCamera(original, animated: false)
+        return ["zoom": found, "headOk": r.head, "altOk": r.alt,
+                "belowHead": b.head, "belowAlt": b.alt]
+    }
+
+    /// MapViewExtension'daki `getCameraAltitude` private oldugu icin ayni formul.
+    private func probeAltitude(centerCoordinate: CLLocationCoordinate2D, zoomLevel: Double) -> Double {
+        let centerPixelY = self.mapView.latitudeToPixelSpaceY(latitude: centerCoordinate.latitude)
+        let zoomScale = pow(2.0, 21.0 - zoomLevel)
+        let scaledMapHeight = Double(self.mapView.bounds.size.height) * zoomScale
+        let topLeftPixelY = centerPixelY - (scaledMapHeight / 2.0)
+        let maxLat = self.mapView.pixelSpaceYToLatitude(pixelY: topLeftPixelY + scaledMapHeight)
+        let topBottom = CLLocationCoordinate2D(latitude: maxLat, longitude: centerCoordinate.longitude)
+        let distance = MKMapPoint(centerCoordinate).distance(to: MKMapPoint(topBottom))
+        return distance / tan(.pi * (15 / 180.0))
+    }
+    
     @objc func calloutTapped(_ sender: UITapGestureRecognizer? = nil) {
         if self.currentlySelectedAnnotation != nil {
             self.channel.invokeMethod("infoWindow#onTap", arguments: ["annotationId": self.currentlySelectedAnnotation!])
@@ -133,6 +238,9 @@ public class AppleMapController: NSObject, FlutterPlatformView {
                     break
                 case "camera#convert":
                     self.cameraConvert(args: args, result: result)
+                    break
+                case "qibla#maxRotatableZoom":
+                    result(self.maxRotatableZoom(from: args["fromZoom"] as? Double ?? 1.0))
                     break
                 case "map#takeSnapshot":
                     self.takeSnapshot(options: SnapshotOptions.init(options: args), onCompletion: { (snapshot: FlutterStandardTypedData?, error: Error?) -> Void in
