@@ -58,6 +58,12 @@ class _PolygonUpdates {
   late Set<PolygonId> polygonIdsToRemove;
   late Set<Polygon> polygonsToChange;
 
+  /// True when there is nothing for the platform side to do.
+  bool get isEmpty =>
+      polygonsToAdd.isEmpty &&
+      polygonIdsToRemove.isEmpty &&
+      polygonsToChange.isEmpty;
+
   Map<String, dynamic> _toMap() {
     final Map<String, dynamic> updateMap = <String, dynamic>{};
 

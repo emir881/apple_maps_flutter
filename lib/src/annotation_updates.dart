@@ -40,9 +40,31 @@ class _AnnotationUpdates {
         .map(idToCurrentAnnotation)
         .toSet();
 
+    // Only annotations whose object actually changed are sent.
+    //
+    // WHY THIS FILTER EXISTS: the intersection used to go through untouched, so
+    // EVERY annotation was serialized and pushed over the method channel on
+    // every `didUpdateWidget` — regardless of whether anything about it moved.
+    // A host that rebuilds its map widget from a sensor stream therefore paid a
+    // full annotation update per sample. Measured in a Flutter host (iPhone 13,
+    // 8 Sep 2026): 4005 map rebuilds in 185 s = 21.6 annotation pushes/second,
+    // with the annotation objects themselves memoized and unchanged. That cost
+    // is invisible to `FrameTiming`, which only sees the Dart build phase.
+    //
+    // `Annotation.==` cannot be used here: it compares `annotationId` only, so
+    // it reports a moved annotation as equal. Identity is used instead, which
+    // is exactly the contract a memoizing host relies on — return the same
+    // instance while nothing changes, a new instance when something does.
+    //
+    // LIMITATION, stated rather than hidden: an annotation MUTATED IN PLACE
+    // (same instance, different field) is skipped. `Annotation` is declared
+    // `const`-constructible with final fields, so in-place mutation is not a
+    // supported use anyway.
     final Set<Annotation> _annotationsToChange = currentAnnotationIds
         .intersection(prevAnnotationIds)
         .map(idToCurrentAnnotation)
+        .where((Annotation current) =>
+            !identical(previousAnnotations[current.annotationId], current))
         .toSet();
 
     annotationsToAdd = _annotationsToAdd;
@@ -53,6 +75,15 @@ class _AnnotationUpdates {
   late Set<Annotation> annotationsToAdd;
   late Set<AnnotationId> annotationIdsToRemove;
   late Set<Annotation> annotationsToChange;
+
+  /// True when there is nothing for the platform side to do.
+  ///
+  /// With the identity filter above this is the common case for a host that
+  /// rebuilds often, so the channel message is worth skipping entirely.
+  bool get isEmpty =>
+      annotationsToAdd.isEmpty &&
+      annotationIdsToRemove.isEmpty &&
+      annotationsToChange.isEmpty;
 
   Map<String, dynamic> _toMap() {
     final Map<String, dynamic> updateMap = <String, dynamic>{};

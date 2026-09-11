@@ -46,9 +46,17 @@ extension AppleMapController: AnnotationDelegate {
         }
         annotationView!.canShowCallout = true
         annotationView!.alpha = CGFloat(annotation.alpha ?? 1.00)
-        let rotation = annotation.rotation ?? 0
-        if(rotation != 0) {
-            annotationView!.transform = CGAffineTransform(rotationAngle: CGFloat(Double(rotation) * .pi / 180));
+        // Rotation VERİLDİYSE transform'u koşulsuz yaz (0 dahil): view
+        // `dequeueReusableAnnotationView` ile yeniden kullanıldığında önceki açı
+        // takılı kalıyordu — eski kod `if rotation != 0` diyordu, açı N→0 olunca
+        // marker eğri duruyordu.
+        //
+        // Rotation VERİLMEDİYSE (nil) transform'a DOKUNMA: açı `annotation#rotate`
+        // kanalından geliyor olabilir; burada sıfırlamak onu silerdi.
+        if let rotation = annotation.rotation {
+            annotationView!.transform = rotation == 0
+                ? .identity
+                : CGAffineTransform(rotationAngle: CGFloat(Double(rotation) * .pi / 180))
         }
         annotationView!.isDraggable = annotation.isDraggable ?? false
         return annotationView!
@@ -128,9 +136,87 @@ extension AppleMapController: AnnotationDelegate {
         }
     }
 
+    /// Marker'ı YERİNDE günceller — `removeAnnotation` + `addAnnotation` YAPMAZ.
+    ///
+    /// Eski hal her Dart-tarafı annotation değişiminde marker'ı silip yeniden
+    /// ekliyordu. Qibla'da kullanıcı ok'unun `rotation`/`icon`/`position`'ı
+    /// pusula frekansında (~30 örnek/sn) değiştiği için MKMapView marker'ı
+    /// saniyede onlarca kez yeniden kuruyor, ekranda "göz kırpma" oluşuyordu.
+    /// `FlutterAnnotation.==` bu üç alanı da karşılaştırdığı için Dart tarafında
+    /// ne yapılırsa yapılsın buraya düşüyordu; kalıcı çözüm burada.
+    ///
+    /// `coordinate` `@objc dynamic` olduğu için atama KVO ile MapKit'e bildirilir
+    /// (marker kaymaz, zıplamaz). Görsel alanlar mevcut view üzerinde güncellenir.
     private func updateAnnotationOnMap(oldAnnotation: FlutterAnnotation, newAnnotation :FlutterAnnotation) {
-        removeAnnotation(id: oldAnnotation.id)
-        self.mapView.addAnnotation(newAnnotation)
+        // Icon TÜRÜ değiştiyse view'ın SINIFI da değişmeli (PIN ↔ MARKER ↔ CUSTOM);
+        // bu tek meşru sil-ekle yolu. Qibla'da tür sabit (CUSTOM_FROM_BYTES) →
+        // bu dal pratikte çalışmaz.
+        if oldAnnotation.icon.iconType != newAnnotation.icon.iconType {
+            AnnotationUpdateStats.shared.recordRebuild(reason: "iconType")
+            removeAnnotation(id: oldAnnotation.id)
+            self.mapView.addAnnotation(newAnnotation)
+            return
+        }
+
+        let iconChanged = oldAnnotation.icon != newAnnotation.icon
+        let rotationChanged = oldAnnotation.rotation != newAnnotation.rotation
+        let coordinateChanged = oldAnnotation.coordinate.latitude != newAnnotation.coordinate.latitude
+            || oldAnnotation.coordinate.longitude != newAnnotation.coordinate.longitude
+
+        // ── Model alanları ────────────────────────────────────────────────
+        oldAnnotation.coordinate = newAnnotation.coordinate
+        oldAnnotation.title = newAnnotation.title
+        oldAnnotation.subtitle = newAnnotation.subtitle
+        oldAnnotation.infoWindowConsumesTapEvents = newAnnotation.infoWindowConsumesTapEvents
+        oldAnnotation.alpha = newAnnotation.alpha
+        oldAnnotation.rotation = newAnnotation.rotation
+        oldAnnotation.anchor = newAnnotation.anchor
+        oldAnnotation.calloutOffset = newAnnotation.calloutOffset
+        oldAnnotation.isVisible = newAnnotation.isVisible
+        oldAnnotation.isDraggable = newAnnotation.isDraggable
+        oldAnnotation.icon = newAnnotation.icon
+
+        // ── Görsel taraf: mevcut view'ı yeniden kullan ─────────────────────
+        guard let view = self.mapView.view(for: oldAnnotation) else {
+            // View henüz üretilmemiş (annotation ekranın dışında ya da MapKit
+            // daha `viewFor:` çağırmamış). Model güncellendi; view MapKit onu
+            // gösterirken `getAnnotationView` üzerinden doğru kurulur.
+            AnnotationUpdateStats.shared.recordInPlace(viewMissing: true)
+            return
+        }
+
+        if iconChanged, newAnnotation.icon.iconType == .CUSTOM_FROM_ASSET
+            || newAnnotation.icon.iconType == .CUSTOM_FROM_BYTES {
+            // Yalnız görseli değiştir — view'ı atmaya gerek yok. (Qibla'da
+            // kıble bulundu/bulunamadı ok ikonunu değiştiriyor.)
+            view.image = newAnnotation.icon.image
+        }
+
+        // Transform'a YALNIZ rotation fiilen değiştiğinde dokun.
+        //
+        // `iconChanged`'de dokunmak YANLIŞ olurdu: Qibla açıyı `annotation#rotate`
+        // kanalıyla veriyor (annotation'ın `rotation` alanı nil geliyor), ikon
+        // değişiminde transform'u sıfırlamak o açıyı silerdi — ok bir anlık düz
+        // dururdu. `rotation` nil ise burası hiç çalışmaz, doğru davranış bu.
+        if rotationChanged, let degrees = newAnnotation.rotation {
+            view.transform = degrees == 0
+                ? .identity
+                : CGAffineTransform(rotationAngle: CGFloat(Double(degrees) * .pi / 180))
+        }
+
+        if !(newAnnotation.isVisible ?? true) {
+            view.canShowCallout = false
+            view.alpha = 0.0
+            view.isDraggable = false
+        } else {
+            view.canShowCallout = true
+            view.alpha = CGFloat(newAnnotation.alpha ?? 1.0)
+            view.isDraggable = newAnnotation.isDraggable ?? false
+        }
+
+        AnnotationUpdateStats.shared.recordInPlace(
+            icon: iconChanged, rotation: rotationChanged, coordinate: coordinateChanged
+        )
     }
 
     private func initInfoWindow(annotation: FlutterAnnotation, annotationView: MKAnnotationView) {

@@ -58,6 +58,12 @@ class _CircleUpdates {
   late Set<CircleId> circleIdsToRemove;
   late Set<Circle> circlesToChange;
 
+  /// True when there is nothing for the platform side to do.
+  bool get isEmpty =>
+      circlesToAdd.isEmpty &&
+      circleIdsToRemove.isEmpty &&
+      circlesToChange.isEmpty;
+
   Map<String, dynamic> _toMap() {
     final Map<String, dynamic> updateMap = <String, dynamic>{};
 

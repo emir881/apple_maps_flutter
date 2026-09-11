@@ -26,6 +26,12 @@ public extension MKMapView {
     
     var maxZoomLevel: Double {
         set(_maxZoomLevel) {
+            // Re-applying the SAME limit must not touch the camera. The setter
+            // below writes the camera with `animated: false`, which cancels any
+            // running `animateCamera`. Hosts re-send options on every rebuild,
+            // so without this guard a programmatic zoom animation could be
+            // killed dozens of times per second.
+            if Holder._maxZoomLevel == _maxZoomLevel { return }
             Holder._maxZoomLevel = _maxZoomLevel
             if Holder._zoomLevel > _maxZoomLevel {
                 if #available(iOS 9.0, *) {
@@ -42,6 +48,9 @@ public extension MKMapView {
     
     var minZoomLevel: Double {
         set(_minZoomLevel) {
+            // See `maxZoomLevel`: an unchanged limit must be a no-op, otherwise
+            // the camera write below cancels running animations.
+            if Holder._minZoomLevel == _minZoomLevel { return }
             Holder._minZoomLevel = _minZoomLevel
             if Holder._zoomLevel < _minZoomLevel {
                 if #available(iOS 9.0, *) {
@@ -136,6 +145,59 @@ public extension MKMapView {
         }
     }
     
+    /// Rotates the camera to `heading` — and optionally recenters it on
+    /// `target` — while leaving the camera's SCALE untouched.
+    ///
+    /// This exists because the `setCenterCoordinate` path cannot express
+    /// "rotate only". That path takes a zoom LEVEL and converts it to an
+    /// altitude through `getCameraAltitude`, so every rotation has to supply a
+    /// zoom value. The two directions are not inverses of each other:
+    /// `calculatedZoomLevel` reads the level back from the visible region,
+    /// while `getCameraAltitude` derives an altitude from a fixed 15° field of
+    /// view. Round-tripping a level through them returns a slightly different
+    /// level, so a map that rotates continuously (a qibla compass, say) drifts
+    /// away from the zoom the user picked — a little on every frame.
+    ///
+    /// Here no zoom level is involved at all: the live camera is copied and
+    /// only its heading (and center) is modified, so the altitude carries over
+    /// unchanged and the scale cannot drift.
+    ///
+    /// - Returns: `true` when the heading was applied. `false` means the camera
+    ///   was not in a usable state and the caller should decide what to do —
+    ///   failing silently would leave a rotating map frozen with no way to
+    ///   tell why.
+    @discardableResult
+    func setCameraHeading(heading: CLLocationDirection, target: CLLocationCoordinate2D?, animated: Bool) -> Bool {
+        guard heading.isFinite else { return false }
+
+        // A zero-sized map view has no meaningful camera: `layoutSubviews` has
+        // not run for these bounds, so altitude and center are still whatever
+        // they were beforehand. Writing a camera in that state produces the
+        // same broken values the read path has to guard against.
+        guard self.bounds.size.width > 0, self.bounds.size.height > 0 else { return false }
+
+        guard let camera = self.camera.copy() as? MKMapCamera else { return false }
+        guard camera.altitude.isFinite, camera.altitude > 0 else { return false }
+
+        let wrapped = heading.truncatingRemainder(dividingBy: 360)
+        camera.heading = wrapped < 0 ? wrapped + 360 : wrapped
+
+        if let target = target, CLLocationCoordinate2DIsValid(target) {
+            camera.centerCoordinate = target
+        }
+
+        // Keep `Holder._heading` in sync. `layoutSubviews` and
+        // `setCenterCoordinate` both re-apply the camera from the Holder, so a
+        // stale value there would snap the map back to the previous heading on
+        // the next relayout or programmatic move.
+        Holder._heading = camera.heading
+
+        // `Holder._zoomLevel` is deliberately left alone: rotating does not
+        // change the scale, so the stored level is still the correct one.
+        self.setCamera(camera, animated: animated)
+        return true
+    }
+
     func setBounds(_ positionData: Dictionary<String, Any>, animated: Bool) {
         guard let targetList :Array<Array<CLLocationDegrees>> = positionData["target"] as? Array<Array<CLLocationDegrees>> else { return }
         let padding :Double = positionData["padding"] as? Double ?? 0
@@ -226,6 +288,44 @@ public extension MKMapView {
         return altitude
     }
     
+    /// The zoom level the camera is ACTUALLY at, derived from `camera.altitude`.
+    ///
+    /// Why not `calculatedZoomLevel`: that reads the level back from
+    /// `region.span.longitudeDelta`, and the visible region is the BOUNDING BOX
+    /// of a rotated viewport — so on a rotating map the same camera reads up to
+    /// a full zoom level differently (measured: 6.01 … 7.02 with the camera
+    /// untouched on a 390x844 screen). It cannot be used for a decision.
+    ///
+    /// `camera.altitude` is heading-independent. This inverts the exact function
+    /// the write path uses (`getCameraAltitude`) by bisection, so a commanded
+    /// level and the level reported here are on the same scale by construction —
+    /// no formula drift between read and write.
+    ///
+    /// Returns `nil` when the view has no usable bounds/camera yet.
+    func actualZoomLevel() -> Double? {
+        guard self.bounds.size.width > 0, self.bounds.size.height > 0 else { return nil }
+        let altitude = self.camera.altitude
+        guard altitude.isFinite, altitude > 0 else { return nil }
+        let center = self.centerCoordinate
+        guard CLLocationCoordinate2DIsValid(center) else { return nil }
+
+        // `getCameraAltitude` is monotonically DECREASING in zoom (higher zoom =
+        // closer camera), so bisection needs the comparison in that direction.
+        var lo = 1.0    // far
+        var hi = 21.0   // near
+        for _ in 0..<24 {
+            let mid = (lo + hi) / 2
+            let midAlt = getCameraAltitude(centerCoordinate: center, zoomLevel: mid)
+            guard midAlt.isFinite, midAlt > 0 else { return nil }
+            if midAlt > altitude {
+                lo = mid    // still too far out
+            } else {
+                hi = mid
+            }
+        }
+        return (lo + hi) / 2
+    }
+
     func getVisibleRegion() -> Dictionary<String, Array<Double>> {
         if self.bounds.size != CGSize.zero {
             // convert center coordiate to pixel space

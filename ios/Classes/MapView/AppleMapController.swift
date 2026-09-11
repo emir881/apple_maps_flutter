@@ -232,6 +232,15 @@ public class AppleMapController: NSObject, FlutterPlatformView {
                     self.moveCamera(args: args)
                     result(nil)
                     break
+                case "camera#setHeading":
+                    result(self.setCameraHeading(args: args))
+                    break
+                case "camera#annoStats":
+                    // Teşhis: annotation güncelleme yolunun toplamları. Dart
+                    // tarafı PULL eder çünkü native log (`print`/`NSLog`)
+                    // `flutter run` çıktısına düşmüyor.
+                    result(AnnotationUpdateStats.shared.snapshot())
+                    break
                 case "annotation#rotate":
                     self.rotateAnnotation(args:args)
                     result(nil)
@@ -299,6 +308,60 @@ public class AppleMapController: NSObject, FlutterPlatformView {
                     break
                 case "camera#getZoomLevel":
                     result(self.mapView.calculatedZoomLevel)
+                    break
+                // Diagnostic read-back of the camera's ACTUAL heading.
+                //
+                // `setCameraHeading` cannot report whether the map really got
+                // there: `setCamera(_:animated:)` has no completion handler, so
+                // the channel returns the instant the call is made. Without a
+                // read-back a commanded angle and a refused/interrupted one look
+                // identical from Dart, and a rotation that silently does not
+                // move is exactly the failure we are chasing.
+                //
+                // Unlike `calculatedZoomLevel` this value is trustworthy while
+                // the map rotates — it is read straight off the camera, not
+                // derived from the visible region's bounding box.
+                // Heading PLUS the camera's real centre.
+                //
+                // The centre is here (and not only in `camera#onMove`) because
+                // that gesture callback under-reports: it is driven by native
+                // `UIGestureRecognizer`s that a Flutter platform-view gesture
+                // team can win, so a host that pans the map may see almost no
+                // `camera#onMove` at all (measured: 16 events in a 185 s session
+                // that contained deliberate panning). Anything that has to know
+                // "is the map still centred on X" needs the camera itself.
+                case "camera#getHeading":
+                    let centre = self.mapView.centerCoordinate
+                    result([
+                        "heading": self.mapView.camera.heading,
+                        "lat": centre.latitude,
+                        "lng": centre.longitude,
+                    ])
+                    break
+                // The zoom level the camera is ACTUALLY at, plus the raw
+                // altitude it was derived from.
+                //
+                // `camera#getZoomLevel` (`calculatedZoomLevel`) cannot answer
+                // this on a rotating map: it is derived from the visible
+                // region's bounding box, which grows as the map turns. Every
+                // zoom decision that trusted it was really trusting the heading.
+                // This one inverts the write path's own altitude function, so
+                // commanded and reported levels share one scale.
+                // The centre rides along so a host can answer "is the map still
+                // centred where I put it" without a second round trip, and
+                // without depending on `camera#onMove` (see `camera#getHeading`).
+                case "camera#actualZoom":
+                    if let zoom = self.mapView.actualZoomLevel() {
+                        let centre = self.mapView.centerCoordinate
+                        result([
+                            "zoom": zoom,
+                            "altitude": self.mapView.camera.altitude,
+                            "lat": centre.latitude,
+                            "lng": centre.longitude,
+                        ])
+                    } else {
+                        result(nil)
+                    }
                     break
                 default:
                     result(FlutterMethodNotImplemented)
@@ -371,6 +434,25 @@ public class AppleMapController: NSObject, FlutterPlatformView {
             }
             self.mapView.setBounds(positionData, animated: false)
         }
+    }
+
+    /// Rotates the map without going through a camera position, so no zoom
+    /// level crosses the channel — see `MKMapView.setCameraHeading`.
+    ///
+    /// `target` is optional: omit it to rotate around the current center, pass
+    /// it to rotate and recenter in the same camera write. Doing both in one
+    /// write matters for a continuously rotating map — two separate writes let
+    /// MapKit render an intermediate frame, which reads as a stutter.
+    private func setCameraHeading(args: Dictionary<String, Any>) -> Bool {
+        guard let heading: CLLocationDirection = args["heading"] as? CLLocationDirection else {
+            return false
+        }
+        var target: CLLocationCoordinate2D?
+        if let targetList: Array<CLLocationDegrees> = args["target"] as? Array<CLLocationDegrees>, targetList.count == 2 {
+            target = CLLocationCoordinate2D(latitude: targetList[0], longitude: targetList[1])
+        }
+        let animated: Bool = args["animated"] as? Bool ?? false
+        return self.mapView.setCameraHeading(heading: heading, target: target, animated: animated)
     }
 
      private func rotateAnnotation(args: Dictionary<String, Any>) -> Void {

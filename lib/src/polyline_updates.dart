@@ -38,9 +38,15 @@ class _PolylineUpdates {
         .map(idToCurrentPolyline)
         .toSet();
 
+    // Identity filter — same reasoning as `_AnnotationUpdates`: an unchanged
+    // polyline used to be re-serialized and re-sent on every rebuild, and a
+    // polyline carries its whole point list, so it is the more expensive of the
+    // two. Hosts that memoize their polylines get the saving for free.
     final Set<Polyline> _polylinesToChange = currentPolylineIds
         .intersection(prevPolylineIds)
         .map(idToCurrentPolyline)
+        .where((Polyline current) =>
+            !identical(previousPolylines[current.polylineId], current))
         .toSet();
 
     polylinesToAdd = _polylinesToAdd;
@@ -51,6 +57,12 @@ class _PolylineUpdates {
   late Set<Polyline> polylinesToAdd;
   late Set<PolylineId> polylineIdsToRemove;
   late Set<Polyline> polylinesToChange;
+
+  /// True when there is nothing for the platform side to do.
+  bool get isEmpty =>
+      polylinesToAdd.isEmpty &&
+      polylineIdsToRemove.isEmpty &&
+      polylinesToChange.isEmpty;
 
   Map<String, dynamic> _toMap() {
     final Map<String, dynamic> updateMap = <String, dynamic>{};

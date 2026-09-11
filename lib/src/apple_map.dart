@@ -179,9 +179,44 @@ class _AppleMapState extends State<AppleMap> {
   Map<CircleId, Circle> _circles = <CircleId, Circle>{};
   late _AppleMapOptions _appleMapOptions;
 
-  @override
-  Widget build(BuildContext context) {
-    final Map<String, dynamic> creationParams = <String, dynamic>{
+  // `creationParams` is read by the platform-view factory ONLY when the native
+  // view is created; later builds hand it over and it is ignored. Rebuilding it
+  // every frame therefore serialized all four collections for nothing — and a
+  // polyline carries its whole point list. Measured in a Flutter host that
+  // rebuilds its map from a sensor stream: 21.6 rebuilds/second, so four full
+  // set serializations per rebuild went straight to the garbage collector.
+  //
+  // The cache is keyed on the IDENTITY of everything that feeds it, so a real
+  // change still produces fresh params for a view that is created later (after
+  // a hot restart, or when the key changes). Identity is the right key here:
+  // the collections are supplied by the host, and a host that mutates a set in
+  // place already breaks `didUpdateWidget` diffing.
+  Map<String, dynamic>? _creationParamsCache;
+  CameraPosition? _cpCamera;
+  _AppleMapOptions? _cpOptions;
+  Set<Annotation>? _cpAnnotations;
+  Set<Polyline>? _cpPolylines;
+  Set<Polygon>? _cpPolygons;
+  Set<Circle>? _cpCircles;
+
+  Map<String, dynamic> _buildCreationParams() {
+    final Map<String, dynamic>? cached = _creationParamsCache;
+    if (cached != null &&
+        identical(_cpCamera, widget.initialCameraPosition) &&
+        identical(_cpOptions, _appleMapOptions) &&
+        identical(_cpAnnotations, widget.annotations) &&
+        identical(_cpPolylines, widget.polylines) &&
+        identical(_cpPolygons, widget.polygons) &&
+        identical(_cpCircles, widget.circles)) {
+      return cached;
+    }
+    _cpCamera = widget.initialCameraPosition;
+    _cpOptions = _appleMapOptions;
+    _cpAnnotations = widget.annotations;
+    _cpPolylines = widget.polylines;
+    _cpPolygons = widget.polygons;
+    _cpCircles = widget.circles;
+    return _creationParamsCache = <String, dynamic>{
       'initialCameraPosition': widget.initialCameraPosition._toMap(),
       'options': _appleMapOptions.toMap(),
       'annotationsToAdd': _serializeAnnotationSet(widget.annotations),
@@ -189,6 +224,11 @@ class _AppleMapState extends State<AppleMap> {
       'polygonsToAdd': _serializePolygonSet(widget.polygons),
       'circlesToAdd': _serializeCircleSet(widget.circles),
     };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final Map<String, dynamic> creationParams = _buildCreationParams();
     if (defaultTargetPlatform == TargetPlatform.iOS) {
       return UiKitView(
         viewType: 'apple_maps_plugin.luisthein.de/apple_maps',
@@ -235,32 +275,59 @@ class _AppleMapState extends State<AppleMap> {
   }
 
   void _updateAnnotations() async {
+    final _AnnotationUpdates updates = _AnnotationUpdates.from(
+        _annotations.values.toSet(), widget.annotations);
+    // Nothing changed -> no channel message. Awaiting the controller first
+    // would still be a future hop per rebuild, so the check comes before it.
+    if (updates.isEmpty) {
+      return;
+    }
     final AppleMapController controller = await _controller.future;
-    controller._updateAnnotations(_AnnotationUpdates.from(
-        _annotations.values.toSet(), widget.annotations));
+    controller._updateAnnotations(updates);
     _annotations = _keyByAnnotationId(widget.annotations);
   }
 
   void _updatePolylines() async {
+    final _PolylineUpdates updates =
+        _PolylineUpdates.from(_polylines.values.toSet(), widget.polylines);
+    // Skipping here also skips refreshing `_polylines`, which is correct: an
+    // empty update means every id and every instance already matches the cache.
+    if (updates.isEmpty) {
+      return;
+    }
     final AppleMapController controller = await _controller.future;
-    controller._updatePolylines(
-        _PolylineUpdates.from(_polylines.values.toSet(), widget.polylines));
+    controller._updatePolylines(updates);
     _polylines = _keyByPolylineId(widget.polylines);
   }
 
   void _updatePolygons() async {
+    final _PolygonUpdates updates =
+        _PolygonUpdates.from(_polygons.values.toSet(), widget.polygons);
+    // A host that never passes `polygons` used to pay a fully empty
+    // `polygons#update` on EVERY rebuild — the payload was built from empty
+    // sets and sent anyway. Measured in a Flutter host that rebuilds its map
+    // from a sensor stream (iPhone 13, 8 Sep 2026): 21.6 rebuilds/second, so
+    // this and `circles#update` together were ~43 information-free messages
+    // per second on the thread that also draws MKMapView.
+    if (updates.isEmpty) {
+      return;
+    }
     final AppleMapController controller = await _controller.future;
     // ignore: unawaited_futures
-    controller._updatePolygons(
-        _PolygonUpdates.from(_polygons.values.toSet(), widget.polygons));
+    controller._updatePolygons(updates);
     _polygons = _keyByPolygonId(widget.polygons);
   }
 
   void _updateCircles() async {
+    final _CircleUpdates updates =
+        _CircleUpdates.from(_circles.values.toSet(), widget.circles);
+    // See `_updatePolygons`.
+    if (updates.isEmpty) {
+      return;
+    }
     final AppleMapController controller = await _controller.future;
     // ignore: unawaited_futures
-    controller._updateCircles(
-        _CircleUpdates.from(_circles.values.toSet(), widget.circles));
+    controller._updateCircles(updates);
     _circles = _keyByCircleId(widget.circles);
   }
 
@@ -407,8 +474,33 @@ class _AppleMapOptions {
     final Map<String, dynamic> prevOptionsMap = toMap();
 
     return newOptions.toMap()
-      ..removeWhere(
-          (String key, dynamic value) => prevOptionsMap[key] == value);
+      ..removeWhere((String key, dynamic value) =>
+          _optionValuesEqual(prevOptionsMap[key], value));
+  }
+
+  /// Compares two serialized option values.
+  ///
+  /// Some options serialize to a freshly allocated `List` on every call
+  /// (`minMaxZoomPreference`, `padding`). `List` uses identity equality in
+  /// Dart, so `==` reported them as CHANGED on every rebuild. Consequences,
+  /// measured on a device (iPhone 13, 8 Sep 2026 log of a Flutter host app):
+  ///
+  ///  * `updates` was never empty, so `map#update` was sent on EVERY widget
+  ///    rebuild — ~190 times per 5 s while a compass drove `setState`.
+  ///  * `interpretOptions` re-applied `minZoomLevel`, whose setter WRITES THE
+  ///    CAMERA (`setCenterCoordinateWithAltitude(animated: false)`) when the
+  ///    current zoom is below the limit. That write cancels any running
+  ///    `animateCamera`, so programmatic zoom animations never completed while
+  ///    the host app was notifying listeners.
+  ///
+  /// Comparing lists by value makes the diff behave as intended: unchanged
+  /// options stay out of the update, and `map#update` is skipped entirely when
+  /// nothing changed.
+  static bool _optionValuesEqual(dynamic previous, dynamic next) {
+    if (previous is List && next is List) {
+      return listEquals<dynamic>(previous, next);
+    }
+    return previous == next;
   }
 
   List<double>? _serializePadding(EdgeInsets? insets) {
