@@ -143,6 +143,28 @@ class FlutterPolyline: MKPolyline {
     static func != (lhs: FlutterPolyline, rhs: FlutterPolyline) -> Bool {
         return !(lhs == rhs)
     }
+
+    /// True when `other` differs from this polyline only in color: same points, width,
+    /// visibility, tap handling, pattern, caps, joins and zIndex. Kept next to `==` so a
+    /// new field gets added to both comparisons.
+    func differsOnlyInColor(from other: FlutterPolyline) -> Bool {
+        guard isConsumingTapEvents == other.isConsumingTapEvents,
+              width == other.width,
+              isVisible == other.isVisible,
+              capType == other.capType,
+              pattern == other.pattern,
+              lineJoin == other.lineJoin,
+              zIndex == other.zIndex,
+              let points = coordinates,
+              let otherPoints = other.coordinates,
+              points.count == otherPoints.count else {
+            return false
+        }
+        for (a, b) in zip(points, otherPoints) where a.latitude != b.latitude || a.longitude != b.longitude {
+            return false
+        }
+        return true
+    }
 }
 
 extension FlutterPolyline: FlutterOverlay {
