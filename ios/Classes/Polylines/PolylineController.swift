@@ -50,7 +50,11 @@ extension AppleMapController: PolylineDelegate {
                     if oldFlutterPolyline.id == (polylineData["polylineId"] as! String) {
                         let newPolyline = FlutterPolyline.init(fromDictionaray: polylineData)
                         if oldFlutterPolyline != newPolyline {
-                            updatePolylinesOnMap(oldPolyline: oldFlutterPolyline, newPolyline: newPolyline)
+                            if isColorOnlyChange(oldPolyline: oldFlutterPolyline, newPolyline: newPolyline) {
+                                recolorPolylineInPlace(oldPolyline: oldFlutterPolyline, color: newPolyline.color)
+                            } else {
+                                updatePolylinesOnMap(oldPolyline: oldFlutterPolyline, newPolyline: newPolyline)
+                            }
                         }
                     }
                 }
@@ -79,6 +83,40 @@ extension AppleMapController: PolylineDelegate {
     private func updatePolylinesOnMap(oldPolyline: FlutterPolyline, newPolyline: FlutterPolyline) {
         self.mapView.removeOverlay(oldPolyline)
         addPolyline(polyline: newPolyline)
+    }
+
+    /// Only the color differs: same points, width, visibility, pattern, caps, joins and zIndex.
+    private func isColorOnlyChange(oldPolyline: FlutterPolyline, newPolyline: FlutterPolyline) -> Bool {
+        guard oldPolyline.isConsumingTapEvents == newPolyline.isConsumingTapEvents,
+              oldPolyline.width == newPolyline.width,
+              oldPolyline.isVisible == newPolyline.isVisible,
+              oldPolyline.capType == newPolyline.capType,
+              oldPolyline.pattern == newPolyline.pattern,
+              oldPolyline.lineJoin == newPolyline.lineJoin,
+              oldPolyline.zIndex == newPolyline.zIndex,
+              let oldPoints = oldPolyline.coordinates,
+              let newPoints = newPolyline.coordinates,
+              oldPoints.count == newPoints.count else {
+            return false
+        }
+        for (a, b) in zip(oldPoints, newPoints) where a.latitude != b.latitude || a.longitude != b.longitude {
+            return false
+        }
+        return true
+    }
+
+    /// Repaints the existing overlay instead of removing and re-adding it. A qibla line whose
+    /// color eases with the heading changes color many times per second; remove + add rebuilt
+    /// the overlay (and its renderer) on every step. The model color is updated too, so a
+    /// renderer MapKit creates later (overlay scrolled back into view) picks up the new color.
+    private func recolorPolylineInPlace(oldPolyline: FlutterPolyline, color: UIColor?) {
+        oldPolyline.color = color
+        guard oldPolyline.isVisible == true,
+              let renderer = self.mapView.renderer(for: oldPolyline) as? MKPolylineRenderer else {
+            return
+        }
+        renderer.strokeColor = color
+        renderer.setNeedsDisplay()
     }
     
     private func addPolyline(polyline: FlutterPolyline) {
