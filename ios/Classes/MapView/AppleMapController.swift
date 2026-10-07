@@ -11,6 +11,11 @@ public class AppleMapController: NSObject, FlutterPlatformView {
     var currentlySelectedAnnotation: String?
     var snapShotOptions: MKMapSnapshotter.Options = MKMapSnapshotter.Options()
     var snapShot: MKMapSnapshotter?
+    /// `maxRotatableZoom` ölçümü sürerken kamera olayları Dart'a gönderilmez.
+    /// Delegate KALDIRILMAZ: kaldırılınca MapKit ölçüm sırasında ikon görünümü
+    /// isteyip bulamıyor ve kendi kırmızı işaretçisini (MKMarkerAnnotationView)
+    /// kuruyordu; delegate geri takılınca da o işaretçi kalıcı oluyordu.
+    private var suppressCameraEvents = false
     
     let availableCaps: Dictionary<String, CGLineCap> = [
         "buttCap": CGLineCap.butt,
@@ -117,10 +122,12 @@ public class AppleMapController: NSObject, FlutterPlatformView {
 
         // Olcum sirasinda 8-14 kez setCamera yapiliyor; her biri `regionDidChangeAnimated`
         // tetikleyip Dart'a `camera#onIdle` gonderir ve gereksiz rebuild firtinasi yaratirdi.
-        // Delegate'i olcum boyunca askiya al, sonunda geri tak (defer ile her yolda).
-        let savedDelegate = mapView.delegate
-        mapView.delegate = nil
-        defer { mapView.delegate = savedDelegate }
+        // Kamera olaylari olcum boyunca susturulur (defer ile her yolda geri acilir).
+        // Delegate'e DOKUNULMAZ: ikon gorunumleri ve cizgi cizicisi (viewFor /
+        // rendererFor) olcum sirasinda da bizden gelmeli; yoksa MapKit varsayilan
+        // kirmizi isaretciyi kurar (6 Eki 2026, cihazda yakalandi).
+        suppressCameraEvents = true
+        defer { suppressCameraEvents = false }
 
         // Bir seviyeyi dene: (heading uygulandi mi, kamera istenen uzaklikta kaldi mi)
         func probe(_ zoom: Double) -> (head: Bool, alt: Bool) {
@@ -551,11 +558,13 @@ public class AppleMapController: NSObject, FlutterPlatformView {
 extension AppleMapController: MKMapViewDelegate {
     // onIdle
     public func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+        if suppressCameraEvents { return }
         self.channel.invokeMethod("camera#onIdle", arguments: "")
     }
     
     // onMoveStarted
     public func mapView(_ mapView: MKMapView, regionWillChangeAnimated animated: Bool) {
+        if suppressCameraEvents { return }
         self.channel.invokeMethod("camera#onMoveStarted", arguments: "")
     }
     
@@ -566,7 +575,9 @@ extension AppleMapController: MKMapViewDelegate {
         } else if let flutterAnnotation = annotation as? FlutterAnnotation {
             return self.getAnnotationView(annotation: flutterAnnotation)
         }
-        return nil
+        // nil donulurse MapKit varsayilan kirmizi isaretciyi cizer; tanimadigimiz
+        // isaret icin bos gorunum doner.
+        return MKAnnotationView(annotation: annotation, reuseIdentifier: nil)
     }
 
     public func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView)  {
